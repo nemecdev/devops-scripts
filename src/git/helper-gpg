@@ -1,0 +1,138 @@
+#!/bin/sh
+
+cmd='get'
+file="${HOME}/.git-credentials.gpg"
+credentials=''
+credential_input=''
+
+host=''
+protocol=''
+username=''
+password=''
+
+# Parse arguments
+# **-
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    get ) cmd="$1"; shift ;;
+    --file )
+      if [ "$#" -eq 1 ]; then
+        echo 'Cannot continue, missing value for argument' "$1"
+        exit 1
+      fi
+      cmd="$2";
+      shift 2
+    ;;
+    * ) exit 0 ;;
+  esac
+done
+# -**
+
+# parse_credential_input
+# ----------------------
+# Globals:
+#   $host
+#   $protocol
+#   $username
+#   $password
+# **-
+parse_credential_input() {
+  for i in $credential_input; do
+    case "$i" in
+      host=* ) host=${i#*=} ;;
+      protocol=* ) protocol=${i#*=} ;;
+      username=* ) username=${i#*=} ;;
+      password=* ) password=${i#*=} ;;
+    esac
+  done
+}
+# -**
+
+# parse_credentials
+# -----------------
+# Globals:
+#   $credentials
+# Description:
+#   Parses credentials and stores them in $credentials.
+#   Credentials are delimited by [:space:], e.g. [CREDENTIAL CREDENTIAL]
+#   Each CREDENTIAL consists of "protocol=$;host=$;username=$;password=$"
+# **-
+parse_credentials() {
+  credentials="$(echo "$credentials" | tr '\n' ' ')"
+  for credential in $credentials; do
+    _protocol="${credential%%:*}"
+    _host_part="${credential#*//}"
+    _host="${_host_part##*@}"
+    _login="${_host_part%%@*}"
+    _username="${_login%%:*}"
+    _password="${_login##*:}"
+    parsed="${parsed} protocol=${_protocol};host=${_host};username=${_username};password=${_password}"
+  done
+
+  credentials=${parsed# }
+}
+# -**
+
+# print_credentials
+# -----------------
+# Globals:
+#   $credentials
+#   $host
+# Description:
+#   Loop trhrough $credentials and print one matching $host
+# **-
+print_credentials() {
+  for credential in $credentials; do
+    _host_and_rest="${credential#*host=}"
+    _host_part="${_host_and_rest%%;*}"
+
+    if [ "$host" = "${_host_part}" ]; then
+      echo "$credential" | tr ';' '\n'
+
+      break
+    fi
+  done
+}
+# -**
+
+# get_credentials
+# ---------------
+# Globals:
+#   $file
+# **-
+get_credentials() {
+  _plain_file="${file%.gpg}"
+  gpg -d "${file}" 1> "${_plain_file}" 2> /dev/null
+  credentials="$(cat "$_plain_file")"
+  rm -f "${_plain_file}"
+
+  parse_credential_input
+  parse_credentials
+
+  print_credentials
+}
+# -**
+
+# main
+# ----
+# **-
+main() {
+  while read -r ci; do
+    if [ "$ci" = "" ]; then
+      break
+    fi
+
+    credential_input="${credential_input} ${ci}"
+  done
+
+  if [ "$credential_input" != '' ]; then
+    case "$cmd" in
+      get ) get_credentials
+    esac
+  fi
+  
+  return 0
+}
+# -**
+
+main

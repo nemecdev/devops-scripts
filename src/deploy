@@ -1,0 +1,446 @@
+#!/bin/sh
+#
+# Version: 0.1
+#
+# Perform local deployment.
+#
+## VIMRC - folds
+#set fdm          =marker
+#set fmr          =**-,-**
+##
+
+set -eu
+
+readonly WEB_SERVERS_ENUM="nginx,apache2,httpd"
+
+BASE_PATH="$(pwd)"
+
+env='prod'
+source_dir=''
+target_dir=''
+tmp_target_dir=''
+target_name=''
+
+web_server=''
+web_conf_file=''
+
+before_script=''
+after_script=''
+
+composer_i_trigger=0
+dry_run_trigger=0
+
+# print_help
+# ----------
+#**-
+print_help() {
+  _txt=''
+  printf '\n%-15s %-45s\n' 'USAGE' 'deploy [OPTIONS] [SRC_DIR] TARGET_DIR'
+  for i in $(seq 1 60); do printf '-'; done
+  echo
+  _txt=$(echo "Use this script to deploy project on your server.
+      Deploy SIMPLE app or even WEB app."\
+      | sed 's|^\s*||g;s|\s*$| |g')
+  echo "${_txt}" | fmt -w 60
+  for i in $(seq 1 60); do printf '-'; done
+  echo
+  _txt='(default = ".") dir, repo to be deployed'
+  printf '%-15s %-45s\n' 'SRC_DIR' "${_txt}"
+  _txt='where to deploy on local filesystem'
+  printf '%-15s %-45s\n\n' 'TARGET_DIR' "${_txt}"
+  echo 'OPTIONS'
+  printf '%-25s %-40s\n' '  -h, --help' 'Print this help'
+  printf '%-25s %-40s\n' '  -s, --source-dir' 'Path to source dir, same as'
+  printf '%-25s %-40s\n' '  ' 'SRC_DIR. The last part of absolute'
+  printf '%-25s %-40s\n' '  ' 'path of SRC_DIR after "/" is used'
+  printf '%-25s %-40s\n' '  ' 'as --target-name'
+  printf '%-25s %-40s\n' '  -t, --target-dir' 'Path to target dir, same as'
+  printf '%-25s %-40s\n' '  ' 'TARGET_DIR.'
+  printf '%-25s %-40s\n' '  -n, --target-name' 'Optional name for target dir'
+  printf '%-25s %-40s\n' '  ' 'TARGET_DIR/--target-name,'
+  printf '%-25s %-40s\n' '  ' 'e.g. /var/www/(--target-name)'
+  printf '%-25s %-40s\n' '  -w, --web-server' '"nginx", "apache2", "httpd"'
+  printf '%-25s %-40s\n' '  ' 'used to deploy right server configuration'
+  printf '%-25s %-40s\n' '  -e, --env' '(default = "prod") or'
+  printf '%-25s %-40s\n' '  ' '["prod","dev","test"] Influences'
+  printf '%-25s %-40s\n' '  ' 'deployment if -C is used. E.g "prod"'
+  printf '%-25s %-40s\n' '  ' '=> composer install --no-dev --optimize-autoloader'
+  printf '%-25s %-40s\n' '  -c, --conf-file' 'Web server conf file, by default'
+  printf '%-25s %-40s\n' '  ' 'SRC_DIR/*.conf | SRC_DIR/*.nginx are'
+  printf '%-25s %-40s\n' '  ' 'recognized alphabetically, the'
+  printf '%-25s %-40s\n' '  ' 'first found conf for --web-server'
+  printf '%-25s %-40s\n' '  ' 'is used'
+  printf '%-25s %-40s\n' '  -C, --composer-install'\
+         'Runs composer install in src dir'
+  printf '%-25s %-40s\n' '  ' 'just before deploy'
+  printf '%-25s %-40s\n' '  -D, --dry-run'\
+         'Runs deployment script without'
+  printf '%-25s %-40s\n' '  ' 'changes to the TARGET_DIR'
+  for i in $(seq 1 60); do printf '-'; done
+  echo
+  printf '%-25s %-40s\n' '  --before-script' 'cmd executed in current shell'
+  printf '%-25s %-40s\n' '  ' 'before deploy'
+  printf '%-25s %-40s\n' '  --after-script' 'cmd executed in current shell'
+  printf '%-25s %-40s\n' '  ' 'after deploy'
+}
+#-**
+
+# err_context
+# ---
+#**-
+err_context() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2
+}
+#-**
+
+# err_exit
+# --------
+#**-
+err_exit() {
+  echo 'deploy: e1:' "$*"
+  exit 1
+}
+#-**
+
+# check_next_arg
+# --------------
+# Globals:
+#   None
+# Args:
+#   $1 - Rest of positional args
+#   $2 - Current positional arg
+# Exit:
+#   1 - err_exit call if $1 is last
+# Returns:
+#   0 - on pass
+#**-
+check_next_arg() {
+  if [ "$1" -eq 1 ]; then
+    err_exit 'Cannot set value of' "'$2'"
+  else
+    return 0
+  fi
+}
+#-**
+
+# check_supported_server
+# ----------------------
+# Globals:
+#   None
+# Args:
+#   $1 - Web server name
+# Exit:
+#   1 - err_exit call if $1 is not supported
+# Returns:
+#   0 - if supported
+#**-
+check_supported_server() {
+  _s_list="$(echo "$WEB_SERVERS_ENUM" | tr ',' ' ')"
+  for s in $_s_list; do
+    if [ "$1" = "$s" ]; then
+      return 0
+    fi
+  done
+
+  err_exit "Unsupported '${1}', please choose one of these '${WEB_SERVERS_ENUM}'"
+}
+#-**
+
+# Parse arguments
+# ---------------
+#**-
+t_dir_fuse=0
+s_dir_fuse=0
+if [ "$#" -eq 0 ]; then print_help; exit 0; fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help ) print_help; exit 0 ;;
+    -n | --name ) check_next_arg "$#" "$1"; target_name="$2"; shift 2 ;;
+    -t | --target-dir ) check_next_arg "$#" "$1"; target_dir="$2"; shift 2 ;;
+    -s | --source-dir ) check_next_arg "$#" "$1"; source_dir="$2"; shift 2 ;;
+    -c | --conf-file ) check_next_arg "$#" "$1"; web_conf_file="$2"; shift 2 ;;
+    -e | --env ) check_next_arg "$#" "$1"; env="$2"; shift 2 ;;
+    -w | --web-server )
+      check_next_arg "$#" "$1"
+      check_supported_server "$2"
+      web_server="$2"
+      shift 2 ;;
+    --before-script )
+      check_next_arg "$#" "$1"
+      before_script="$2"
+      shift 2 ;;
+    --after-script )
+      check_next_arg "$#" "$1"
+      after_script="$2"
+      shift 2 ;;
+    -C | --composer-install ) composer_i_trigger=1; shift ;;
+    -D | --dry-run ) dry_run_trigger=1; shift ;;
+    -- ) shift ;;
+    -* )
+      err_exit 'Use of an unsupported argument' "'$1'" ;;
+    * )
+      if [ "$target_dir" = '' ] && [ "$t_dir_fuse" -eq 0 ]; then
+        target_dir="$1"
+        t_dir_fuse=1
+        shift
+        continue 
+      fi
+
+      if [ "$source_dir" = '' ] && [ "$s_dir_fuse" -eq 0 ]; then
+        source_dir="$target_dir"
+        target_dir="$1"
+        s_dir_fuse=1
+      else
+        err_exit 'Argument overflow' "'$1'"
+      fi 
+      shift ;;
+  esac
+done
+#-**
+
+# check_perms
+# -----------------
+# Globals:
+#   None
+# Args:
+#   $1 - Dir (source/target)
+# Exit:
+#   1 - err_exit call on failure
+# Returns:
+#   0 - on success
+#**-
+check_perms() {
+  if ! [ -d "$1" ] || ! [ -w "$1" ] || ! [ -r "$1" ]; then
+    err_exit "Insufficient permissions on dir ${1}"
+  fi
+
+  return 0
+}
+#-**
+
+# cleanup
+# -------
+# Globals:
+#   $tmp_target_dir
+#**-
+cleanup() {
+  rm -rf "$tmp_target_dir"
+}
+#-**
+
+# before_script
+# -------------
+# Globals:
+#   $before_script - script executed in current shell before main()
+#**-
+before_script() {
+  if [ "$before_script" != '' ]; then
+    eval " $before_script"
+  fi
+}
+#-**
+
+# after_script
+# -------------
+# Globals:
+#   $after_script - script executed in current shell after main()
+#**-
+after_script() {
+  if [ "$after_script" != '' ]; then
+    eval " $after_script"
+  fi
+}
+#-**
+
+# prepare_web_server
+# -----------------
+# Globals:
+#   $web_server
+#   $web_conf_file
+#   $source_dir
+# **-
+prepare_web_server() {
+  if [ "$(pgrep -c "${web_server}")" -eq 0 ]; then
+    err_exit "'${web_server}' is not running on your system"
+  fi
+
+  _web_conf_file_name="${BASE_PATH##*/}"
+  _conf_files=''
+  if [ "${web_conf_file}" = '' ]; then
+    if [ "${web_server}" = 'nginx' ]; then
+      _conf_files="$(find . -type f -name '*.nginx' | tr '\n' ' ')"
+    elif [ "${web_server}" = 'apache2' ] || [ "${web_server}" = 'httpd' ] ; then
+      _conf_files="$(find . -type f -name '*.conf' | tr '\n' ' ')"
+      _web_conf_file_name="${_web_conf_file_name}.conf"
+    fi
+
+    web_conf_file="${_conf_files%% *}"
+  fi
+
+  if ! [ -f "${web_conf_file}" ]; then
+    err_exit "'${web_conf_file}'" 'for web server' "'${web_server}'" 'not found'
+  fi
+}
+# -**
+
+# handle_web_server
+# -----------------
+# Globals:
+#   $web_server
+#   $web_conf_file
+# **-
+handle_web_server() {
+  _web_conf_dest="/etc/${web_server}/sites-available"
+  _web_conf_slink_dest="/etc/${web_server}/sites-enabled"
+
+  check_perms "${_web_conf_dest}"
+  check_perms "${_web_conf_slink_dest}"
+
+  echo "Do you wanna reload ${web_server} service [y/N]"
+  read -r _reload
+
+  case "$web_server" in
+    httpd )
+      cp "${web_conf_file}" "/etc/httpd/conf.d/${_web_conf_file_name}"
+      if [ "${_reload}" = 'Y' ] || [ "${_reload}" = 'y' ] || [ "${_reload}" = 'yes' ]; then
+        sudo systemctl reload httpd
+      fi
+    ;;
+    apache2 | nginx )
+      cp "${web_conf_file}" "${_web_conf_dest}/${_web_conf_file_name}"\
+      && rm -f "${_web_conf_slink_dest}/${_web_conf_file_name}"\
+      && ln -s "${_web_conf_dest}/${_web_conf_file_name}"\
+               "${_web_conf_slink_dest}/${_web_conf_file_name}"
+      if [ "${_reload}" = 'Y' ] || [ "${_reload}" = 'y' ]; then
+        sudo systemctl reload "${web_server}"
+      fi
+    ;;
+  esac
+}
+# -**
+
+# trigger_composer
+# ----------------
+# Globals:
+#   $env
+#   $composer_i_trigger
+#   $target_dir
+#   $target_name
+# **-
+trigger_composer() {
+  if [ "$composer_i_trigger" -eq 1 ]; then
+    _dirmem=$(pwd)
+    cd "${target_dir}/${target_name}-staging"
+    if [ "$env" = 'prod' ]; then
+      if ! composer install --no-dev --optimize-autoloader; then
+        err_exit 'composer install error --nod-dev --optimize-autoloader'
+      fi
+    else
+      if ! composer install; then err_exit 'composer install error'; fi
+    fi
+    cd "${_dirmem}"
+  fi
+}
+# -**
+
+# trigger_dry_run
+# ---------------
+# Globals:
+#   $dry_run_trigger
+#   $target_dir
+#   $web_server
+# **-
+trigger_dry_run() {
+  if [ "$dry_run_trigger" -eq 1 ]; then
+    echo 'Dry run ...'
+    _t_dir_rights="$(stat -c '%a' "$target_dir")"
+    target_dir="$tmp_target_dir"
+    chmod "${_t_dir_rights}" "${target_dir}"
+    # Disallow func:handle_web_server
+    web_server=''
+  fi
+}
+# -**
+
+# deploy
+# ------
+# Globals:
+#   $source_dir
+#   $target_dir
+# **-
+deploy() {
+  echo 'Start deployment process [y/N]'
+  read -r _deploy
+  if [ "${_deploy}" = 'Y' ] || [ "${_deploy}" = 'y' ] || [ "${_deploy}" = 'yes' ] ; then
+    if [ "$web_server" != '' ]; then
+      handle_web_server
+    fi
+
+    rm -rf "${target_dir}/${target_name}-staging"
+    cp -a "${source_dir}" "${target_dir}/${target_name}-staging" &&\
+    trigger_composer
+
+    if [ -d "${target_dir}/${target_name}" ]; then
+      rm -rf "${target_dir}/${target_name}-old"
+      mv "${target_dir}/${target_name}" "${target_dir}/${target_name}-old"
+    fi
+
+    mv "${target_dir}/${target_name}-staging" "${target_dir}/${target_name}"
+  fi
+}
+# -**
+
+# main
+# ----
+# Globals:
+#   $source_dir
+#   $target_dir
+#   $tmp_target_dir
+#**-
+main () {
+  tmp_target_dir="$(mktemp -d /tmp/script-deploy-target.XXXXX)"
+  source_dir=${source_dir:='.'}
+  target_dir=${target_dir:="$tmp_target_dir"}
+
+  if [ "$target_dir" = "$source_dir" ]; then
+    err_exit 'Target and Source dir cannot be same'
+  fi
+
+  # Sanitize, remove last "/" from paths
+  source_dir="${source_dir%*/}"
+  target_dir="${target_dir%*/}"
+
+  check_perms "$source_dir"
+  check_perms "$target_dir"
+
+  cd "$source_dir"
+  BASE_PATH="$(pwd)"
+  source_dir="${BASE_PATH}"
+
+  _target_name=${BASE_PATH##*/}
+  target_name=${target_name:="${_target_name}"}
+
+  echo "Really wanna deploy from '${source_dir}' to '${target_dir}/${target_name}'"
+  echo '[y/N]'
+  read -r _start
+  if [ "${_start}" = 'Y' ] || [ "${_start}" = 'y' ] || [ "${_start}" = 'yes' ] ; then
+    trigger_dry_run
+    if [ "$web_server" != '' ]; then
+      prepare_web_server
+    fi
+
+    deploy
+
+    return 0
+  fi
+
+  echo 'Deployment aborted'
+}
+#-**
+
+trap cleanup INT
+trap cleanup EXIT
+
+before_script
+main
+after_script
